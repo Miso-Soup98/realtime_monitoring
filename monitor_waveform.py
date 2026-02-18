@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""实时识别波形窗口：宽厚波形输出 1，细长条形输出 0。"""
+"""Real-time waveform window detection: wide waveform outputs 1, narrow bar outputs 0."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ class DetectorConfig:
     blur_kernel: int = 3
     active_col_ratio_for_one: float = 0.22
     active_col_ratio_for_zero: float = 0.07
-    vertical_fill_for_one: float = 0.35
-    vertical_fill_for_zero: float = 0.18
+    vertical_fill_for_one: float = 0.12  # Reduced from 0.35 to 0.12 based on actual data
+    vertical_fill_for_zero: float = 0.05  # Reduced from 0.18 to 0.05
     min_hold_frames: int = 3
 
 
@@ -52,14 +52,95 @@ class WaveformDetector:
         vertical_fill_ratio = float(ink_mask.mean())
         row_peaks = (row_ink > (0.20 * w)).sum() / float(h)
 
-        is_one = (
+        # Optimization: New features for detecting waveforms that extend beyond ROI
+        # 1. Column span: Detect the distribution range of columns with ink
+        non_zero_cols = np.where(col_ink > 0)[0]
+        if len(non_zero_cols) > 0:
+            col_span = non_zero_cols[-1] - non_zero_cols[0] + 1
+            col_span_ratio = float(col_span) / float(w)
+        else:
+            col_span_ratio = 0.0
+
+        # 2. Average row width: Detect the average width of waveform per row
+        row_widths = []
+        for row_idx in range(h):
+            row_data = ink_mask[row_idx, :]
+            if row_data.sum() > 0:
+                # Find the length of continuous segments
+                diff = np.diff(np.concatenate(([0], row_data.astype(int), [0])))
+                starts = np.where(diff == 1)[0]
+                ends = np.where(diff == -1)[0]
+                if len(starts) > 0:
+                    widths = ends - starts
+                    row_widths.extend(widths)
+        
+        avg_row_width = np.mean(row_widths) if len(row_widths) > 0 else 0.0
+        avg_row_width_ratio = avg_row_width / float(w) if w > 0 else 0.0
+
+        # 3. Edge detection: Detect if there's waveform at ROI edges (may extend beyond ROI)
+        edge_ink_ratio = 0.0
+        if w > 10:
+            edge_width = max(1, w // 10)
+            left_edge = ink_mask[:, :edge_width].mean()
+            right_edge = ink_mask[:, -edge_width:].mean()
+            edge_ink_ratio = max(left_edge, right_edge)
+
+        # Optimized detection logic: Can detect waveforms even when they extend beyond ROI
+        # Condition 1: Traditional method (active columns + vertical fill)
+        is_one_traditional = (
             active_col_ratio >= cfg.active_col_ratio_for_one
             and vertical_fill_ratio >= cfg.vertical_fill_for_one
-            and row_peaks >= 0.08
         )
+        
+        # Condition 2: Large column span AND large average row width
+        # This ensures it's wide horizontally AND thick vertically (not just a thin line)
+        is_one_span_and_width = (
+            col_span_ratio >= 0.3 
+            and avg_row_width_ratio >= 0.12  # Require minimum row width to avoid thin lines
+        )
+        
+        # Condition 3: Large average row width (waveform is wide in each row)
+        is_one_width = avg_row_width_ratio >= 0.15
+        
+        # Condition 4: Waveform extends beyond ROI - detected by edge ink
+        # If edges have ink AND average row width is significant, waveform is likely thick and extends beyond ROI
+        is_one_edge_extended = (
+            edge_ink_ratio >= 0.05  # Edge has ink (waveform extends beyond ROI)
+            and avg_row_width_ratio >= 0.10  # Sufficient thickness in ROI
+            and col_span_ratio >= 0.25  # Waveform spans significant width
+        )
+        
+        # Condition 5: Large column span indicates waveform fills most of ROI width
+        # Even if vertical fill is low (waveform extends beyond ROI vertically),
+        # if column span is large and row width is decent, it's likely a thick waveform
+        is_one_wide_span = (
+            col_span_ratio >= 0.5  # Waveform spans at least half the ROI width
+            and avg_row_width_ratio >= 0.10  # Has decent thickness
+            and vertical_fill_ratio >= 0.03  # Some vertical presence
+        )
+        
+        # Condition 6: Moderate active column ratio AND high vertical fill AND sufficient row width
+        # This ensures it's not just a thin line
+        is_one_relaxed = (
+            active_col_ratio >= 0.15 
+            and vertical_fill_ratio >= 0.08
+            and avg_row_width_ratio >= 0.08  # Require minimum thickness
+        )
+
+        is_one = (
+            is_one_traditional
+            or is_one_span_and_width
+            or is_one_width
+            or is_one_edge_extended
+            or is_one_wide_span
+            or is_one_relaxed
+        )
+        
+        # For zero: either low activity OR thin waveform (low average row width)
         is_zero = (
-            active_col_ratio <= cfg.active_col_ratio_for_zero
-            and vertical_fill_ratio <= cfg.vertical_fill_for_zero
+            (active_col_ratio <= cfg.active_col_ratio_for_zero
+             and vertical_fill_ratio <= cfg.vertical_fill_for_zero)
+            or (avg_row_width_ratio < 0.08 and vertical_fill_ratio < 0.10)  # Thin line detection
         )
 
         if is_one:
@@ -80,6 +161,9 @@ class WaveformDetector:
             "active_col_ratio": active_col_ratio,
             "vertical_fill_ratio": vertical_fill_ratio,
             "row_peaks": row_peaks,
+            "col_span_ratio": col_span_ratio,
+            "avg_row_width_ratio": avg_row_width_ratio,
+            "edge_ink_ratio": edge_ink_ratio,
             "current": current,
             "output": output,
         }
@@ -208,13 +292,19 @@ class InteractiveROISelector:
             self.drag_mode = None
 
     def draw(self, frame: "np.ndarray") -> "np.ndarray":
+        # Create blurred background
         blurred = cv2.GaussianBlur(frame, (51, 51), 0)
+        # Create a fresh display each time to avoid ghosting
         display = blurred.copy()
 
         x, y, w, h = self.roi
+        # Copy original frame to ROI area
         display[y : y + h, x : x + w] = frame[y : y + h, x : x + w]
 
+        # Draw ROI rectangle
         cv2.rectangle(display, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        
+        # Draw instruction text
         cv2.putText(
             display,
             "Drag to move/resize ROI, Enter=confirm, Esc=cancel",
@@ -226,21 +316,25 @@ class InteractiveROISelector:
             cv2.LINE_AA,
         )
 
+        # Draw buttons
         for rect_name, rect in self._button_rects().items():
             bx, by, bw, bh = rect
             color = (0, 180, 0) if rect_name == "confirm" else (0, 0, 200)
             cv2.rectangle(display, (bx, by), (bx + bw, by + bh), color, -1)
-            symbol = "✓" if rect_name == "confirm" else "✕"
-            cv2.putText(
-                display,
-                symbol,
-                (bx + 6, by + bh - 7),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            
+            # Draw symbols using lines instead of Unicode characters to avoid display issues
+            if rect_name == "confirm":
+                # Draw checkmark using lines
+                center_x = bx + bw // 2
+                center_y = by + bh // 2
+                # Left part of checkmark
+                cv2.line(display, (bx + 8, center_y), (center_x - 2, by + bh - 8), (255, 255, 255), 3)
+                # Right part of checkmark
+                cv2.line(display, (center_x - 2, by + bh - 8), (bx + bw - 8, by + 8), (255, 255, 255), 3)
+            else:
+                # Draw X using lines
+                cv2.line(display, (bx + 8, by + 8), (bx + bw - 8, by + bh - 8), (255, 255, 255), 3)
+                cv2.line(display, (bx + bw - 8, by + 8), (bx + 8, by + bh - 8), (255, 255, 255), 3)
 
         return display
 
@@ -299,6 +393,11 @@ def run_video_mode(args: argparse.Namespace) -> int:
     detector = WaveformDetector(
         DetectorConfig(roi=parse_roi(args.roi), min_hold_frames=args.hold_frames)
     )
+
+    # Create preview window once before the loop
+    if args.preview:
+        # Use WINDOW_AUTOSIZE to automatically fit the image, maintaining aspect ratio
+        cv2.namedWindow("waveform-monitor", cv2.WINDOW_AUTOSIZE)
 
     frame_idx = 0
     while True:
@@ -367,6 +466,17 @@ def run_screen_mode(args: argparse.Namespace) -> int:
 
         detector = WaveformDetector(DetectorConfig(roi=roi, min_hold_frames=args.hold_frames))
 
+        # Create preview window once before the loop
+        if args.preview:
+            # Use WINDOW_AUTOSIZE to automatically fit the image, maintaining aspect ratio
+            # Limit window size to screen size to avoid oversized windows
+            cv2.namedWindow("waveform-monitor-screen", cv2.WINDOW_NORMAL)
+            # Set a reasonable initial window size (can be resized by user)
+            # Use monitor dimensions but scale down if too large
+            max_width = min(monitor["width"], 1920)
+            max_height = min(monitor["height"], 1080)
+            cv2.resizeWindow("waveform-monitor-screen", max_width, max_height)
+
         while True:
             shot = sct.grab(monitor)
             frame = np.array(shot)[:, :, :3]
@@ -401,23 +511,23 @@ def run_screen_mode(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="实时监测波形窗口并输出 1/0")
+    parser = argparse.ArgumentParser(description="Real-time waveform window monitoring, outputs 1/0")
     parser.add_argument(
         "--source",
         default="da3fd50e6979f4b2cc582dfe0695445b.mp4",
-        help="视频文件路径（默认使用仓库中的录屏文件）",
+        help="Video file path (default uses the recorded file in repository)",
     )
-    parser.add_argument("--roi", default=None, help="感兴趣区域，格式 x,y,w,h")
-    parser.add_argument("--hold-frames", type=int, default=3, help="去抖动帧数")
-    parser.add_argument("--preview", action="store_true", help="显示调试画面，按 q 退出")
+    parser.add_argument("--roi", default=None, help="Region of interest, format x,y,w,h")
+    parser.add_argument("--hold-frames", type=int, default=3, help="Debounce frame count")
+    parser.add_argument("--preview", action="store_true", help="Show debug window, press q to exit")
 
-    parser.add_argument("--screen", action="store_true", help="启用屏幕实时监测模式")
-    parser.add_argument("--interactive-roi", action="store_true", help="全屏交互式选取 ROI")
+    parser.add_argument("--screen", action="store_true", help="Enable real-time screen monitoring mode")
+    parser.add_argument("--interactive-roi", action="store_true", help="Full-screen interactive ROI selection")
     parser.add_argument("--screen-left", type=int, default=0)
     parser.add_argument("--screen-top", type=int, default=0)
     parser.add_argument("--screen-width", type=int, default=800)
     parser.add_argument("--screen-height", type=int, default=600)
-    parser.add_argument("--interval-ms", type=int, default=60, help="screen 模式采样间隔")
+    parser.add_argument("--interval-ms", type=int, default=60, help="Sampling interval in screen mode (ms)")
     return parser
 
 
